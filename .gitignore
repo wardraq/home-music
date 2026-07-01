@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Music library (解密后的音乐文件不提交)
+music_library/*
+!music_library/.gitkeep
+
+# 原始 ncm 文件
+*.ncm
+
+# macOS
+.DS_Store
