@@ -1,0 +1,10 @@
+# NCM 解密密钥配置示例
+# 复制此文件为 config/ncm_keys.yaml 并填入密钥
+
+ncm:
+  # AES 核心密钥，用于解密 RC4 会话密钥
+  core_key: "YOUR_CORE_KEY_HERE"
+  # AES 元数据密钥，用于解密歌曲元数据
+  meta_key: "YOUR_META_KEY_HERE"
+  # NCM 文件魔数
+  magic: "4354454E4644414D"

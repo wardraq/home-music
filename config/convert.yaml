@@ -1,0 +1,60 @@
+# 转换策略配置
+# 用于 scripts/convert.py
+
+# 默认输出格式（按目标平台）
+# 可选: alac, mp3_320, mp3_192, mp3_v0, flac, wav
+default_format: alac
+
+# 目标平台（决定默认格式和兼容性）
+# apple_music: 默认 alac（支持 FLAC 的文件用 FLAC）
+# generic: 默认 mp3_320
+target_platform: apple_music
+
+# 格式策略
+formats:
+  alac:
+    description: "Apple Lossless (Apple Music 兼容，无损)"
+    output_ext: ".m4a"
+    codec: "alac"
+    container: "m4af"
+    # 保留原始采样率和位深度
+    preserve_sample_rate: true
+    preserve_bits: true
+
+  mp3_320:
+    description: "MP3 320kbps (高音质，通用)"
+    output_ext: ".mp3"
+    bitrate: 320
+    # MP3 最高支持 48kHz，自动降采样
+    max_sample_rate: 48000
+
+  mp3_192:
+    description: "MP3 192kbps (平衡音质和体积)"
+    output_ext: ".mp3"
+    bitrate: 192
+    max_sample_rate: 48000
+
+  flac:
+    description: "FLAC 无损 (通用无损格式)"
+    output_ext: ".flac"
+    preserve_sample_rate: true
+    preserve_bits: true
+
+# 文件处理策略
+file_handling:
+  # 转换后是否删除原文件
+  delete_original: false
+  # 是否覆盖已存在的输出文件
+  overwrite: false
+  # 输出目录 (相对于项目根目录，空则输出到原文件同目录)
+  # 建议留空，转换后用 organize.py 按 歌手/专辑/ 整理
+  output_dir: ""
+  # 转换后是否自动运行 organize.py
+  auto_organize: true
+
+# 标签处理
+tags:
+  # 是否复制源文件标签到输出文件
+  copy_tags: true
+  # 如果目标格式不支持某些标签，是否忽略错误继续
+  ignore_tag_errors: true

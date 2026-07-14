@@ -224,5 +224,11 @@ music_library/*
 # 原始 ncm 文件
 *.ncm
 
+# 本地密钥与敏感配置（不提交到仓库）
+config/ncm_keys.yaml
+config/*.local.yaml
+config/*.local.yml
+.env
+
 # macOS
 .DS_Store

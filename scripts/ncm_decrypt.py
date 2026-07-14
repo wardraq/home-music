@@ -10,20 +10,22 @@ NCM 文件结构:
   2. Gap: 2 bytes
   3. Key Data: 4 bytes length + AES-128-ECB 加密的 RC4 密钥 (XOR 0x64)
   4. Meta Data: 4 bytes length + AES-128-ECB 加密的 JSON (XOR 0x63 + base64)
-  5. CRC32: 4 bytes
-  6. Gap: 5 bytes
-  7. Album Image: 4 bytes size + image data
-  8. Music Data: RC4 加密的音频数据
+  5. CRC32 + Gap: 5 bytes (4 bytes CRC32 + 1 byte gap)
+  6. Album Image: 4 bytes image_space + 4 bytes image_size + image_size bytes 数据 + (image_space - image_size) bytes 填充
+  7. Music Data: RC4 加密的音频数据
 
 用法:
   python ncm_decrypt.py <input.ncm> [-o output_dir]
   python ncm_decrypt.py <input_dir> [-o output_dir]  # 批量
+
+密钥配置文件: config/ncm_keys.yaml（已 gitignore，不会提交）
 """
 
 import argparse
 import base64
 import binascii
 import json
+import logging
 import os
 import struct
 import sys
@@ -31,19 +33,47 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
+import yaml
 from Crypto.Cipher import AES
 from mutagen.flac import FLAC
 from mutagen.id3 import (
     ID3, TIT2, TPE1, TALB, TYER, TRCK, APIC, USLT, TCON, error as ID3Error
 )
 from mutagen.mp3 import MP3
+from utils import sanitize_filename
 
-# AES 密钥（16 bytes，网易云内置）
-CORE_KEY = binascii.a2b_hex("687A4852416D736F356B496E62617857")
-META_KEY = binascii.a2b_hex("2331346C6A6B5F215C5D2630553C2728")
 
-# NCM 文件魔数
-NCM_MAGIC = binascii.a2b_hex("4354454E4644414D")  # "CTENFDAM"
+def load_keys(config_path: str = "config/ncm_keys.yaml") -> dict:
+    """从本地配置文件加载 NCM 解密密钥"""
+    # 优先从脚本所在目录的相对路径查找
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        Path(config_path),
+        script_dir / ".." / config_path,
+        script_dir / ".." / "config" / "ncm_keys.yaml",
+    ]
+
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.exists():
+            with open(candidate, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            return cfg.get("ncm", {})
+
+    raise FileNotFoundError(
+        f"找不到 NCM 密钥配置文件: {config_path}\n"
+        "请复制 config/ncm_keys.yaml.example 为 config/ncm_keys.yaml 并填入密钥。"
+    )
+
+
+# 加载本地密钥配置
+_keys = load_keys()
+CORE_KEY = binascii.a2b_hex(_keys.get("core_key", ""))
+META_KEY = binascii.a2b_hex(_keys.get("meta_key", ""))
+NCM_MAGIC = binascii.a2b_hex(_keys.get("magic", ""))
+
+if not CORE_KEY or not META_KEY or not NCM_MAGIC:
+    raise ValueError("NCM 密钥配置不完整，请检查 config/ncm_keys.yaml")
 
 
 @dataclass
@@ -61,11 +91,11 @@ class NcmMeta:
 
 
 def _unpad(data: bytes) -> bytes:
-    """去除 PKCS7 padding"""
+    """去除 PKCS7 padding，防御恶意数据"""
     if not data:
         return data
-    pad_len = data[-1] if isinstance(data[-1], int) else ord(data[-1])
-    if pad_len > 16:
+    pad_len = data[-1]
+    if pad_len < 1 or pad_len > 16:
         return data
     return data[:-pad_len]
 
@@ -129,17 +159,28 @@ def parse_ncm(file_path: str) -> tuple[bytes, NcmMeta]:
             try:
                 meta_json = json.loads(meta_data)
                 meta = _parse_meta_json(meta_json)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logging.warning(f"元数据 JSON 解析失败（{file_path}）: {e}")
 
-        # 6. 跳过 CRC32 (4 bytes)
-        f.read(4)
-
-        # 7. 跳过 5 字节 gap，读取专辑封面
+        # 6. 跳过 5 字节 (CRC32 4 bytes + gap 1 byte)
         f.seek(5, 1)
+
+        # 7. 读取专辑封面 (image_space=总空间, image_size=实际图片大小)
+        MAX_IMAGE_SIZE = 100 * 1024 * 1024  # 100MB 上限
+        image_space = struct.unpack("<I", f.read(4))[0]
         image_size = struct.unpack("<I", f.read(4))[0]
+
+        if image_space > MAX_IMAGE_SIZE:
+            raise ValueError(f"image_space 异常大: {image_space} bytes，拒绝处理")
+        if image_size > MAX_IMAGE_SIZE:
+            raise ValueError(f"image_size 异常大: {image_size} bytes，拒绝处理")
+        if image_size > image_space:
+            raise ValueError(f"image_size({image_size}) > image_space({image_space})，文件损坏")
+
         if image_size > 0:
             meta.album_image = f.read(image_size)
+        # 跳过封面区域的填充字节（image_space >= image_size 已验证）
+        f.seek(image_space - image_size, 1)
 
         # 8. 解密音频数据 (RC4 流式解密)
         audio_chunks = []
@@ -169,7 +210,15 @@ def _parse_meta_json(meta_json: dict) -> NcmMeta:
 
     artists = meta_json.get("artist", [])
     if isinstance(artists, list):
-        meta.artist = [[a.get("name", ""), a.get("id", 0)] for a in artists]
+        for a in artists:
+            if isinstance(a, dict):
+                meta.artist.append([a.get("name", ""), a.get("id", 0)])
+            elif isinstance(a, list) and len(a) >= 2:
+                meta.artist.append([str(a[0]), a[1]])
+            elif isinstance(a, list) and len(a) == 1:
+                meta.artist.append([str(a[0]), 0])
+            elif isinstance(a, str):
+                meta.artist.append([a, 0])
     elif isinstance(artists, str):
         meta.artist = [[artists, 0]]
 
@@ -191,23 +240,15 @@ def _parse_meta_json(meta_json: dict) -> NcmMeta:
     return meta
 
 
-def _sanitize_filename(name: str) -> str:
-    """清理文件名非法字符"""
-    if not name:
-        return ""
-    illegal = '<>:"/\\|?*\n\r\t'
-    for ch in illegal:
-        name = name.replace(ch, "")
-    return name.strip().strip(".")
 
 
 def write_audio_file(audio_data: bytes, meta: NcmMeta, output_dir: str,
                      original_filename: str = "") -> str:
     """写入音频文件 + ID3 标签"""
     ext = "flac" if meta.format == "flac" else "mp3"
-    safe_name = _sanitize_filename(meta.music_name)
+    safe_name = sanitize_filename(meta.music_name)
     if not safe_name:
-        safe_name = _sanitize_filename(Path(original_filename).stem) or "unknown"
+        safe_name = sanitize_filename(Path(original_filename).stem) or "unknown"
     out_filename = f"{safe_name}.{ext}"
     out_path = os.path.join(output_dir, out_filename)
 
@@ -222,6 +263,23 @@ def write_audio_file(audio_data: bytes, meta: NcmMeta, output_dir: str,
 
     _write_tags(out_path, meta, ext)
     return out_path
+
+
+def _detect_image_mime(image_data: Optional[bytes]) -> str:
+    """根据文件头检测图片 MIME 类型"""
+    if not image_data:
+        return "image/jpeg"
+    if image_data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_data.startswith(b"RIFF") and image_data[8:12] == b"WEBP":
+        return "image/webp"
+    if image_data[:2] in (b"BM", b"BA", b"CI", b"CP"):
+        return "image/bmp"
+    if image_data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"  # 默认回退
 
 
 def _write_tags(file_path: str, meta: NcmMeta, ext: str):
@@ -247,7 +305,7 @@ def _write_mp3_tags(file_path: str, meta: NcmMeta, artist_str: str):
         if meta.track_number:
             tags.add(TRCK(encoding=3, text=meta.track_number))
         if meta.album_image:
-            mime = "image/jpeg" if meta.album_image[:3] == b"\xff\xd8\xff" else "image/png"
+            mime = _detect_image_mime(meta.album_image)
             tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=meta.album_image))
         if meta.lyrics:
             tags.add(USLT(encoding=3, lang="chi", desc="", text=meta.lyrics))
@@ -270,7 +328,7 @@ def _write_flac_tags(file_path: str, meta: NcmMeta, artist_str: str):
             from mutagen.flac import Picture
             pic = Picture()
             pic.type = 3
-            pic.mime = "image/jpeg" if meta.album_image[:3] == b"\xff\xd8\xff" else "image/png"
+            pic.mime = _detect_image_mime(meta.album_image)
             pic.desc = "Cover"
             pic.data = meta.album_image
             audio.add_picture(pic)
@@ -333,6 +391,10 @@ def decrypt_directory(input_dir: str, output_dir: str = ".") -> dict:
 
 
 def main():
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s: %(message)s",
+    )
     parser = argparse.ArgumentParser(
         description="NCM 文件解密工具 - 将网易云音乐 .ncm 解密为 MP3/FLAC"
     )

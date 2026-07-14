@@ -42,7 +42,7 @@ home-music/
 ## 技术栈
 
 - Python 3.12+
-- [ncmdump](https://github.com/nanomsg/nanomsg) - NCM 解密
+- [ncmdump](https://github.com/QCloudHao/ncmdump) - NCM 解密参考实现
 - [mutagen](https://github.com/quodlibet/mutagen) - ID3 标签处理
 - [beets](https://beets.io/) - 音乐库管理（可选，进阶整理）
 
